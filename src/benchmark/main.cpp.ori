@@ -1,0 +1,287 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+/*
+ * Simple benchmark that runs a mixture of point lookups and inserts on ALEX.
+ */
+
+
+#include <algorithm>
+#include <vector>
+#include <iomanip>
+#include <iostream>
+#include <random>
+#include <chrono> //For system_clock
+#include <bits/stdc++.h>
+#include <map>
+#include <numeric>
+#include <tuple>
+#include <stdlib.h>
+
+#include "absl/strings/str_format.h"
+#include "ortools/base/logging.h"
+#include "ortools/sat/cp_model.h"
+#include "ortools/sat/cp_model.pb.h"
+#include "ortools/sat/cp_model_solver.h"
+#include "ortools/algorithms/knapsack_solver.h"
+
+#include "flags.h"
+#include "utils.h"
+#include "alex_nodes.h"
+#include "attack.h"                             /*Rui:our attack logics*/
+#include "alex.h"
+#include "leap_util.h"
+
+// Modify these if running your own workload
+#define KEY_TYPE double 
+#define PAYLOAD_TYPE double
+
+//sample szie for lookup
+
+
+/*
+ * Required flags:
+ * --keys_file              path to the file that contains keys
+ * --keys_file_type         file type of keys_file (options: binary or text)
+ * --init_num_keys          number of keys to bulk load with
+ * --total_num_keys         total number of keys in the keys file
+ * --batch_size             number of operations (lookup or insert) per batch
+ *
+ * Optional flags:
+ * --insert_frac            fraction of operations that are inserts (instead of
+ * lookups)
+ * --lookup_distribution    lookup keys distribution (options: uniform or zipf)
+ * --time_limit             time limit, in minutes
+ * --print_batch_stats      whether to output stats for each batch
+ */
+
+
+
+int main(int argc, char* argv[]) {
+    auto flags = parse_flags(argc, argv);
+    std::string out_file_path = get_required(flags, "out_file_path");
+    std::string datanode_stat_path = get_required(flags, "datanode_stat_path");
+    std::string keys_file_path = get_required(flags, "keys_file");
+    std::string keys_file_type = get_required(flags, "keys_file_type");
+    auto init_num_keys = stoi(get_required(flags, "init_num_keys"));
+    auto total_num_keys = stoi(get_required(flags, "total_num_keys"));
+    auto batch_size = stoi(get_required(flags, "batch_size"));
+    std::string dataset_distribution_type = get_with_default(flags, "dataset_distribution_type", "norm");
+    std::string attack_key_distribution_type = get_with_default(flags, "attack_key_distribution_type", "norm");
+
+    auto insert_frac = stod(get_with_default(flags, "insert_frac", "0.5"));
+    std::string lookup_distribution =
+        get_with_default(flags, "lookup_distribution", "zipf");
+
+    auto strategy = stoi(get_required(flags, "strategy"));
+    auto num_actions_allowed = stoi(get_with_default(flags, "num_actions_allowed", "1"));
+    auto num_batchs_per_attack = stoi(get_with_default(flags, "num_batchs_per_attack", "1"));
+    auto budget_percent = stod(get_required(flags, "budget_percent"));
+    auto attack_key_use_norm = stoi(get_with_default(flags, "attack_key_use_norm", "0"));
+
+    //auto num_epochs = stoi(get_required(flags, "num_epochs"));
+
+
+
+    //attack::print_execution_stats("=======finish loading========");
+
+
+    // Read keys from file
+    auto keys = new KEY_TYPE[total_num_keys];
+    if (keys_file_type == "binary") {
+        load_binary_data(keys, total_num_keys, keys_file_path);
+    } else if (keys_file_type == "text") {
+        load_text_data(keys, total_num_keys, keys_file_path);
+    } else {
+        std::cerr << "--keys_file_type must be either 'binary' or 'text'"
+            << std::endl;
+        return 1;
+    }
+
+
+
+
+    // Combine bulk loaded keys with randomly generated payloads
+    auto values = new std::pair<KEY_TYPE, PAYLOAD_TYPE>[init_num_keys];
+    std::mt19937_64 gen_payload(std::random_device{}());
+    for (int i = 0; i < init_num_keys; i++) {
+        values[i].first = keys[i];
+        values[i].second = static_cast<PAYLOAD_TYPE>(gen_payload());
+    }
+
+    //attack::print_execution_stats("=======finish keys generation========");
+
+    // Create ALEX and bulk load
+    alex::Alex<KEY_TYPE, PAYLOAD_TYPE> index;
+    std::sort(values, values + init_num_keys,
+            [](auto const& a, auto const& b) { return a.first < b.first; });
+    index.bulk_load(values, init_num_keys);
+
+    //attack::print_execution_stats("=======finish bulk_load()========");
+
+
+
+    //create workloads(insert and lookup)
+    int num_inserts_per_batch = static_cast<int>(batch_size * insert_frac);
+    int num_lookups_per_batch = batch_size - num_inserts_per_batch;
+    int i = init_num_keys;
+    int num_poison_key = budget_percent * total_num_keys;
+    int num_keys_before_attack = 0;
+    int num_actual_poison_key_inserts = 0;
+
+    std::vector<double> chosen_node_density;
+
+    Stats s;
+
+
+    while(true)
+    {
+        if (i > 0) {
+            KEY_TYPE* lookup_keys = nullptr;
+            if (lookup_distribution == "uniform") {
+                lookup_keys = get_search_keys(keys, i, num_lookups_per_batch);
+            } else if (lookup_distribution == "zipf") {
+                lookup_keys = get_search_keys_zipf(keys, i, num_lookups_per_batch);
+            } else {
+                std::cerr << "--lookup_distribution must be either 'uniform' or 'zipf'"
+                    << std::endl;
+                return 1;
+            }
+            //auto lookups_start_time = std::chrono::high_resolution_clock::now();
+            for (int j = 0; j < num_lookups_per_batch; j++) {
+                KEY_TYPE key = lookup_keys[j];
+                PAYLOAD_TYPE* payload = index.get_payload(key);
+                if (payload) {
+                }
+            }
+            
+            delete[] lookup_keys;
+        }
+
+
+
+        // Do inserts
+        int num_actual_inserts =
+            std::min(num_inserts_per_batch, total_num_keys - i);
+        int num_keys_after_batch = i + num_actual_inserts;
+
+        for (; i < num_keys_after_batch; i++) {
+            if(strategy == 1 && i + 1 == total_num_keys - num_poison_key) {
+                resetStats(s);
+                num_actual_poison_key_inserts += attack::launch_batched_knapsack_attack(index,
+                        num_batchs_per_attack,
+                        num_poison_key, 1, attack_key_use_norm, s, chosen_node_density);
+                i += num_actual_poison_key_inserts;
+            } else if(strategy == 2 && i + 1 == total_num_keys - num_poison_key) {
+                resetStats(s);
+                num_actual_poison_key_inserts += attack::launch_mck_attack( index,
+                        num_poison_key,
+                        num_actions_allowed,
+                        attack_key_use_norm,
+                        s,
+                        chosen_node_density);
+                i += num_actual_poison_key_inserts;
+            } else if(strategy == 3 && i + 1 == total_num_keys - num_poison_key) {
+               num_actual_poison_key_inserts += attack::launch_greedy_attack(index,
+                        num_poison_key,
+                        num_actions_allowed,
+                        attack_key_use_norm,
+                        s,
+                        chosen_node_density);
+                i += num_actual_poison_key_inserts;
+            }
+
+            index.insert(keys[i], static_cast<PAYLOAD_TYPE>(gen_payload()));
+        }
+
+        if (num_actual_inserts < num_inserts_per_batch) {
+            // End if we have inserted all keys in a workload with inserts
+            break;
+        }
+    }
+
+    //std::cout<<"=====finished workload with combined inserts&lookups=====\n";
+
+    std::vector<alex::AlexDataNode<KEY_TYPE, PAYLOAD_TYPE>*> dns;
+    index.get_all_datanodes(dns);
+    long long total_mem = 0;
+    int size = dns.size();
+    for(int i= 0; i < size; i++) {
+        total_mem += dns[i]->data_size();
+    }
+
+    double mean = 0.0;
+    double variance = 0.0;
+    double sum = 0.0;
+    
+    for(int i = 0; i < chosen_node_density.size(); i++) {
+        sum += chosen_node_density[i];
+    }
+
+    mean = sum / chosen_node_density.size();
+
+    
+
+    for(int i = 0; i < chosen_node_density.size(); i++) {
+        variance += (chosen_node_density[i] - mean) * (chosen_node_density[i] - mean);
+    }
+
+    variance /= chosen_node_density.size();
+    
+
+
+    std::ofstream outputFile, outputFile_1;
+    outputFile.open(out_file_path, std::ios_base::app);
+    outputFile_1.open(datanode_stat_path, std::ios_base::app);
+
+
+    outputFile_1<<strategy<<","
+        <<index.stats_.num_keys<<","
+        <<budget_percent<<","
+        <<num_batchs_per_attack<<","
+        <<num_actions_allowed<<","
+        <<total_mem<<","
+        <<mean<<","
+        <<variance
+        <<std::endl;
+
+
+
+
+
+
+    outputFile<<index.stats_.num_keys<<","
+        <<num_keys_before_attack<<","
+        <<num_poison_key<<","
+        <<strategy<<","
+        <<budget_percent<<","
+        <<num_batchs_per_attack<<","
+        <<num_actions_allowed<<","
+        <<total_mem
+        <<std::endl;
+
+     /*
+    std::cout<<index.stats_.num_keys<<","
+        <<num_keys_before_attack<<","
+        <<num_poison_key<<","
+        <<strategy<<","
+        <<budget_percent<<","
+        <<num_actions_allowed<<","
+        <<num_batchs_per_attack<<","
+        <<s.total_selected_size<<","
+        <<s.total_budget_needed<<","
+        <<s.total_budget_to_trigger_all_dns<<","
+        <<s.total_expected_mem<<","
+        <<total_mem
+        <<std::endl;*/
+
+    outputFile.close();
+    outputFile_1.close();
+
+
+    delete[] keys;
+    delete[] values;
+
+    return 0;
+
+}
